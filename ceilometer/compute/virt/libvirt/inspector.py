@@ -23,6 +23,7 @@ import six
 from ceilometer.compute.pollsters import util
 from ceilometer.compute.virt import inspector as virt_inspector
 from ceilometer.i18n import _
+from ceilometer.compute.virt.libvirt import qemu_guest_agent
 
 libvirt = None
 
@@ -78,7 +79,7 @@ class LibvirtInspector(virt_inspector.Inspector):
             if libvirt is None:
                 libvirt = __import__('libvirt')
             LOG.debug('Connecting to libvirt: %s', self.uri)
-            self.connection = libvirt.openReadOnly(self.uri)
+            self.connection = libvirt.open(self.uri)
 
         return self.connection
 
@@ -181,10 +182,15 @@ class LibvirtInspector(virt_inspector.Inspector):
 
         try:
             memory_stats = domain.memoryStats()
-            if (memory_stats and
+            if (instance.hw_qemu_guest_agent == 'yes' and
+                    instance.os_type != 'windows'):
+                memory_used = qemu_guest_agent.QemuGuestAgent().memoryUsage(domain)
+                memory_used = memory_used / units.Ki
+                return virt_inspector.MemoryUsageStats(usage=memory_used)
+            elif (memory_stats and
                     memory_stats.get('available') and
                     memory_stats.get('unused')):
-                memory_used = (memory_stats.get('available') -
+                memory_used = (memory_stats.get('available') - 
                                memory_stats.get('unused'))
                 # Stat provided from libvirt is in KB, converting it to MB.
                 memory_used = memory_used / units.Ki

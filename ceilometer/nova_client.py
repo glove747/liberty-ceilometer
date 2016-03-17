@@ -125,7 +125,9 @@ class Client(object):
             cache[iid] = image
 
         attr_defaults = [('kernel_id', None),
-                         ('ramdisk_id', None)]
+                         ('ramdisk_id', None),
+                         ('hw_qemu_guest_agent', None),
+                         ('os_type', None)]
 
         instance.image['name'] = (
             getattr(image, 'name') if image else 'unknown-id-%s' % iid)
@@ -134,6 +136,9 @@ class Client(object):
         for attr, default in attr_defaults:
             ameta = image_metadata.get(attr) if image_metadata else default
             setattr(instance, attr, ameta)
+            
+        for key in image_metadata.keys():
+            setattr(instance, key, image_metadata[key])
 
     @logged
     def instance_get_all_by_host(self, hostname, since=None):
