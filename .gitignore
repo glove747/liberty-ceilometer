@@ -15,7 +15,8 @@ etc/ceilometer/ceilometer.conf
 subunit.log
 tools/lintstack.head.py
 tools/pylint_exceptions
-*pydev*
+*.pydev*
+*.idea/*
 
 # Files created by releasenotes build
 releasenotes/build
