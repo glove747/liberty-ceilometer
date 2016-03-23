@@ -100,12 +100,12 @@ class QemuGuestAgent(object):
         return COMMAND % {"cmd": "guest-file-read",
                           "arg": arg}
         
-    def memoryUsage(self, domain):
+    def memory_usage(self, domain):
         memory_states = self.guest_file_read(domain, "/proc/meminfo")
         memory = {}
         for memory_state in memory_states.split('\n'):
             if not memory_state:
-                break
+                continue
             memory_infos = memory_state.split(':')
             memory[memory_infos[0]] = memory_infos[1][:-3]
         memory_usage = int(memory["MemTotal"]) - int(memory["MemFree"]) - \

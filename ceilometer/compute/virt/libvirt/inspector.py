@@ -22,8 +22,9 @@ import six
 
 from ceilometer.compute.pollsters import util
 from ceilometer.compute.virt import inspector as virt_inspector
-from ceilometer.i18n import _
 from ceilometer.compute.virt.libvirt import qemu_guest_agent
+from ceilometer.i18n import _
+
 
 libvirt = None
 
@@ -184,7 +185,7 @@ class LibvirtInspector(virt_inspector.Inspector):
             memory_stats = domain.memoryStats()
             if (instance.hw_qemu_guest_agent == 'yes' and
                     instance.os_type != 'windows'):
-                memory_used = qemu_guest_agent.QemuGuestAgent().memoryUsage(domain)
+                memory_used = qemu_guest_agent.QemuGuestAgent().memory_usage(domain)
                 memory_used = memory_used / units.Ki
                 return virt_inspector.MemoryUsageStats(usage=memory_used)
             elif (memory_stats and
