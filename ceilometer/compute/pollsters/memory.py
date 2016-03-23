@@ -79,7 +79,7 @@ class MemoryResidentPollster(pollsters.BaseComputePollster):
                     instance, self._inspection_duration)
                 LOG.debug("RESIDENT MEMORY: %(instance)s %(resident)f",
                           {'instance': instance,
-                           'resident': memory_info.resident})
+                        'resident': memory_info.resident})
                 yield util.make_sample_from_instance(
                     instance,
                     name='memory.resident',
