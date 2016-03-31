@@ -1,233 +1,176 @@
+# Copyright 2011 OpenStack Foundation
+# All Rights Reserved.
 #
-# Copyright 2012 Red Hat, Inc
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
 #
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-# not use this file except in compliance with the License. You may obtain
-# a copy of the License at
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations
-# under the License.
-"""Implementation of Inspector abstraction for libvirt."""
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
 
-from lxml import etree
-from oslo_config import cfg
+"""
+Manages information about the qemu guest agent.
+
+This class encapsulates libvirt qemu provides certain
+higher level APIs around the raw libvirt qemu API.
+These APIs are then used by all the other libvirt
+related classes
+"""
+
+import base64
+import os
+import time
+
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
+
+from nova import exception
+from nova.i18n import _
 from oslo_log import log as logging
-from oslo_utils import units
-import six
-
-from ceilometer.compute.pollsters import util
-from ceilometer.compute.virt import inspector as virt_inspector
-from ceilometer.compute.virt.libvirt import qemu_guest_agent
-from ceilometer.i18n import _
-
 
 libvirt = None
+libvirt_qemu = None
 
 LOG = logging.getLogger(__name__)
 
-OPTS = [
-    cfg.StrOpt('libvirt_type',
-               default='kvm',
-               choices=['kvm', 'lxc', 'qemu', 'uml', 'xen'],
-               help='Libvirt domain type.'),
-    cfg.StrOpt('libvirt_uri',
-               default='',
-               help='Override the default libvirt URI '
-                    '(which is dependent on libvirt_type).'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(OPTS)
+COMMAND = '{"execute": "%(cmd)s", "arguments": %(arg)s}'
+FILE_READ_COUNT = 102400
 
 
-def retry_on_disconnect(function):
-    def decorator(self, *args, **kwargs):
-        try:
-            return function(self, *args, **kwargs)
-        except libvirt.libvirtError as e:
-            if (e.get_error_code() in (libvirt.VIR_ERR_SYSTEM_ERROR,
-                                       libvirt.VIR_ERR_INTERNAL_ERROR) and
-                e.get_error_domain() in (libvirt.VIR_FROM_REMOTE,
-                                         libvirt.VIR_FROM_RPC)):
-                LOG.debug('Connection to libvirt broken')
-                self.connection = None
-                return function(self, *args, **kwargs)
-            else:
-                raise
-    return decorator
+def to_dict(s):
+    return jsonutils.loads(s)
+
+def strip(s):
+    return to_dict(s)["return"]
 
 
-class LibvirtInspector(virt_inspector.Inspector):
-
-    per_type_uris = dict(uml='uml:///system', xen='xen:///', lxc='lxc:///')
+class QemuGuestAgent(object):
 
     def __init__(self):
-        self.uri = self._get_uri()
-        self.connection = None
+        global libvirt
+        if libvirt is None:
+            libvirt = importutils.import_module('libvirt')
 
-    def _get_uri(self):
-        return CONF.libvirt_uri or self.per_type_uris.get(CONF.libvirt_type,
-                                                          'qemu:///system')
+        global libvirt_qemu
+        if libvirt_qemu is None:
+            libvirt_qemu = importutils.import_module('libvirt_qemu')
 
-    def _get_connection(self):
-        if not self.connection:
-            global libvirt
-            if libvirt is None:
-                libvirt = __import__('libvirt')
-            LOG.debug('Connecting to libvirt: %s', self.uri)
-            self.connection = libvirt.open(self.uri)
+    def qemu_agent_command(self, domain, cmd, timeout=1000, flags=0):
+        return libvirt_qemu.qemuAgentCommand(domain, cmd, timeout, flags)
 
-        return self.connection
+    def guest_file_read(self, domain, path):
+        # open file
+        cmd = self._guest_file_open_command(path, "r")
+        ret = self.qemu_agent_command(domain, cmd)
+        handle = strip(ret)
 
-    def check_sanity(self):
-        if not self._get_connection():
-            raise virt_inspector.NoSanityException()
-
-    @retry_on_disconnect
-    def _lookup_by_uuid(self, instance):
-        instance_name = util.instance_name(instance)
         try:
-            return self._get_connection().lookupByUUIDString(instance.id)
+            # read file
+            cmd = self._guest_file_read_command(handle, FILE_READ_COUNT)
+            ret = self.qemu_agent_command(domain, cmd)
+            ret = strip(ret)
+            eof = ret["eof"]
+            content = base64.b64decode(ret["buf-b64"])
+            while not eof:
+                cmd = self._guest_file_read_command(handle, FILE_READ_COUNT)
+                ret = self.qemu_agent_command(domain, cmd)
+                ret = strip(ret)
+                eof = ret["eof"]
+                content += base64.b64decode(ret["buf-b64"])
+        finally:
+            # close file
+            cmd = self._guest_file_close_command(handle)
+            self.qemu_agent_command(domain, cmd)
+
+        return content
+
+    def _guest_file_open_command(self, path, mode):
+        arg = '{"path": "%s", "mode": "%s"}' % (path, mode)
+        return COMMAND % {"cmd": "guest-file-open",
+                          "arg": arg}
+
+    def _guest_file_close_command(self, handle):
+        arg = '{"handle": %d}' % handle
+        return COMMAND % {"cmd": "guest-file-close",
+                          "arg": arg}
+
+    def _guest_file_read_command(self, handle, count=4096):
+        arg = '{"handle": %d, "count": %d}' % (handle, count)
+        return COMMAND % {"cmd": "guest-file-read",
+                          "arg": arg}
+
+    def _guest_exec_command(self, cmd, parms):
+        arg = '{"path": "%s", "capture-output": true' % (cmd)
+        # parms type is listG eg. '"arg":["-h"]'
+        if parms:
+            arg = arg + parms
+        arg = arg + '}'
+        return COMMAND % {"cmd": "guest-exec",
+                          "arg": arg}
+
+    def _guest_exec_status_command(self, pid):
+        arg = '{"pid": %d}' % (pid)
+        return COMMAND % {"cmd": "guest-exec-status",
+                          "arg": arg}
+
+    def memory_usage(self, domain):
+        memory_usage = 0
+        try:
+            memory_states = self.guest_file_read(domain, "/proc/meminfo")
+            memory = {}
+            for memory_state in memory_states.split('\n'):
+                if not memory_state:
+                    continue
+                memory_infos = memory_state.split(':')
+                memory[memory_infos[0]] = memory_infos[1][:-3]
+            memory_usage = int(memory["MemTotal"]) - int(memory["MemFree"]) - \
+                int(memory["Buffers"]) - int(memory["Cached"])
         except Exception as ex:
-            if not libvirt or not isinstance(ex, libvirt.libvirtError):
-                raise virt_inspector.InspectorException(six.text_type(ex))
-            error_code = ex.get_error_code()
-            if (error_code in (libvirt.VIR_ERR_SYSTEM_ERROR,
-                               libvirt.VIR_ERR_INTERNAL_ERROR) and
-                ex.get_error_domain() in (libvirt.VIR_FROM_REMOTE,
-                                          libvirt.VIR_FROM_RPC)):
-                raise
-            msg = _("Error from libvirt while looking up instance "
-                    "<name=%(name)s, id=%(id)s>: "
-                    "[Error Code %(error_code)s] "
-                    "%(ex)s") % {'name': instance_name,
-                                 'id': instance.id,
-                                 'error_code': error_code,
-                                 'ex': ex}
-            raise virt_inspector.InstanceNotFoundException(msg)
+             LOG.warn(_("qemu-gust-agent collect memory failed: %s"), ex)
+        return memory_usage
 
-    def inspect_cpus(self, instance):
-        domain = self._lookup_by_uuid(instance)
-        dom_info = domain.info()
-        return virt_inspector.CPUStats(number=dom_info[3], time=dom_info[4])
+    def guest_exec_command(self, domain, guest_command, parms=None):
+        result = {}
+        cmd = self._guest_exec_command(guest_command, parms)
+        ret = self.qemu_agent_command(domain, cmd)
+        ret = strip(ret)
+        pid = ret['pid']
+        cmd = self._guest_exec_status_command(pid)
+        t = 0
+        while True:
+            result = self.qemu_agent_command(domain, cmd)
+            result = strip(result)
+            if t == 5:
+                return err("execute command timeout")
+            if result['exited']:
+                break
+            time.sleep(1)
+            t += 1
+        return result
 
-    def _get_domain_not_shut_off_or_raise(self, instance):
-        instance_name = util.instance_name(instance)
-        domain = self._lookup_by_uuid(instance)
-
-        state = domain.info()[0]
-        if state == libvirt.VIR_DOMAIN_SHUTOFF:
-            msg = _('Failed to inspect data of instance '
-                    '<name=%(name)s, id=%(id)s>, '
-                    'domain state is SHUTOFF.') % {
-                'name': instance_name, 'id': instance.id}
-            raise virt_inspector.InstanceShutOffException(msg)
-
-        return domain
-
-    def inspect_vnics(self, instance):
-        domain = self._get_domain_not_shut_off_or_raise(instance)
-
-        tree = etree.fromstring(domain.XMLDesc(0))
-        for iface in tree.findall('devices/interface'):
-            target = iface.find('target')
-            if target is not None:
-                name = target.get('dev')
-            else:
-                continue
-            mac = iface.find('mac')
-            if mac is not None:
-                mac_address = mac.get('address')
-            else:
-                continue
-            fref = iface.find('filterref')
-            if fref is not None:
-                fref = fref.get('filter')
-
-            params = dict((p.get('name').lower(), p.get('value'))
-                          for p in iface.findall('filterref/parameter'))
-            interface = virt_inspector.Interface(name=name, mac=mac_address,
-                                                 fref=fref, parameters=params)
-            dom_stats = domain.interfaceStats(name)
-            stats = virt_inspector.InterfaceStats(rx_bytes=dom_stats[0],
-                                                  rx_packets=dom_stats[1],
-                                                  tx_bytes=dom_stats[4],
-                                                  tx_packets=dom_stats[5])
-            yield (interface, stats)
-
-    def inspect_disks(self, instance):
-        domain = self._get_domain_not_shut_off_or_raise(instance)
-
-        tree = etree.fromstring(domain.XMLDesc(0))
-        for device in filter(
-                bool,
-                [target.get("dev")
-                 for target in tree.findall('devices/disk/target')]):
-            disk = virt_inspector.Disk(device=device)
-            block_stats = domain.blockStats(device)
-            stats = virt_inspector.DiskStats(read_requests=block_stats[0],
-                                             read_bytes=block_stats[1],
-                                             write_requests=block_stats[2],
-                                             write_bytes=block_stats[3],
-                                             errors=block_stats[4])
-            yield (disk, stats)
-
-    def inspect_memory_usage(self, instance, duration=None):
-        instance_name = util.instance_name(instance)
-        domain = self._get_domain_not_shut_off_or_raise(instance)
-
+    def disk_info(self, domain, device):
+        disk_infos = {}
+        disk_infos['total_size'] = 0
+        disk_infos['used_size'] = 0
         try:
-            memory_stats = domain.memoryStats()
-            if (instance.hw_qemu_guest_agent == 'yes' and
-                    instance.os_type != 'windows'):
-                memory_used = qemu_guest_agent.QemuGuestAgent().memory_usage(domain)
-                memory_used = memory_used / units.Ki
-                return virt_inspector.MemoryUsageStats(usage=memory_used)
-            elif (memory_stats and
-                    memory_stats.get('available') and
-                    memory_stats.get('unused')):
-                memory_used = (memory_stats.get('available') - 
-                               memory_stats.get('unused'))
-                # Stat provided from libvirt is in KB, converting it to MB.
-                memory_used = memory_used / units.Ki
-                return virt_inspector.MemoryUsageStats(usage=memory_used)
-            else:
-                msg = _('Failed to inspect memory usage of instance '
-                        '<name=%(name)s, id=%(id)s>, '
-                        'can not get info from libvirt.') % {
-                    'name': instance_name, 'id': instance.id}
-                raise virt_inspector.NoDataException(msg)
-        # memoryStats might launch an exception if the method is not supported
-        # by the underlying hypervisor being used by libvirt.
-        except libvirt.libvirtError as e:
-            msg = _('Failed to inspect memory usage of %(instance_uuid)s, '
-                    'can not get info from libvirt: %(error)s') % {
-                'instance_uuid': instance.id, 'error': e}
-            raise virt_inspector.NoDataException(msg)
+            result = self.guest_exec_command(domain, "df")
+            if result['exitcode'] == 1:
+                disk_infos['exitcode'] = 1
+                disk_infos['err-data'] = result['err-data']
+                return disk_infos
 
-    def inspect_disk_info(self, instance):
-        domain = self._get_domain_not_shut_off_or_raise(instance)
-
-        tree = etree.fromstring(domain.XMLDesc(0))
-        for device in filter(
-                bool,
-                [target.get("dev")
-                 for target in tree.findall('devices/disk/target')]):
-            disk = virt_inspector.Disk(device=device)
-            block_info = qemu_guest_agent.QemuGuestAgent().disk_info(domain, device)
-            info = virt_inspector.DiskInfo(capacity=block_info['total_size'],
-                                           allocation=block_info['used_size'],
-                                           physical=block_info['used_size'])
-
-            yield (disk, info)
-
-    def inspect_memory_resident(self, instance, duration=None):
-        domain = self._get_domain_not_shut_off_or_raise(instance)
-        memory = domain.memoryStats()['rss'] / units.Ki
-        return virt_inspector.MemoryResidentStats(resident=memory)
+            outdata = base64.b64decode(result['out-data'])
+            for line in outdata.split('\n'):
+                if line.startswith('/dev/' + device):
+                    disk_infos['total_size'] += int(line.split()[1])
+                    disk_infos['used_size'] += int(line.split()[2])
+        except Exception as ex:
+             LOG.warn(_("qemu-gust-agent exec guest-exec failed: %s"), ex)
+             return disk_infos
+        return disk_infos
 
