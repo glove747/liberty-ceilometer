@@ -22,7 +22,7 @@ import six
 
 from ceilometer.compute.pollsters import util
 from ceilometer.compute.virt import inspector as virt_inspector
-from ceilometer.compute.virt.libvirt import qemu_guest_agent as qga
+from ceilometer.compute.virt.libvirt import qemu_guest_agent
 from ceilometer.i18n import _
 
 
@@ -185,11 +185,12 @@ class LibvirtInspector(virt_inspector.Inspector):
             memory_stats = domain.memoryStats()
             if (instance.hw_qemu_guest_agent == 'yes' and
                     instance.os_type != 'windows'):
-                memory_used = qga.QemuGuestAgent().memory_usage(domain)
+                memory_used = qemu_guest_agent.QemuGuestAgent().memory_usage(domain)
                 memory_used = memory_used / units.Ki
                 return virt_inspector.MemoryUsageStats(usage=memory_used)
-            elif (memory_stats and memory_stats.get('available')
-                  and memory_stats.get('unused')):
+            elif (memory_stats and
+                    memory_stats.get('available') and
+                    memory_stats.get('unused')):
                 memory_used = (memory_stats.get('available') -
                                memory_stats.get('unused'))
                 # Stat provided from libvirt is in KB, converting it to MB.
@@ -218,10 +219,10 @@ class LibvirtInspector(virt_inspector.Inspector):
                 [target.get("dev")
                  for target in tree.findall('devices/disk/target')]):
             disk = virt_inspector.Disk(device=device)
-            block_info = domain.blockInfo(device)
-            info = virt_inspector.DiskInfo(capacity=block_info[0],
-                                           allocation=block_info[1],
-                                           physical=block_info[2])
+            block_info = qemu_guest_agent.QemuGuestAgent().disk_info(domain, device)
+            info = virt_inspector.DiskInfo(capacity=block_info['total_size'],
+                                           allocation=block_info['used_size'],
+                                           physical=block_info['used_size'])
 
             yield (disk, info)
 
